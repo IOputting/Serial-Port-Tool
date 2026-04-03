@@ -59,7 +59,7 @@ function App() {
       
       <SerialSettings />
 
-      <div style={{ flex: 1, position: "relative", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, height: "100%", position: "relative", display: "flex", flexDirection: "column" }}>
         
         {activeView === 'basic' && <BasicView />}
         

@@ -120,7 +120,7 @@ export default function BasicView() {
   };
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: "20px", gap: "15px", position: "relative", boxSizing: "border-box" }}>
+    <div style={{ flex: 1, height: "100%", display: "flex", flexDirection: "column", padding: "20px", gap: "15px", position: "relative", boxSizing: "border-box" }}>
       {/* 日志控制工具栏 */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff", padding: "8px 15px", borderRadius: "8px", border: "1px solid #e8e8e8", boxShadow: "0 1px 4px rgba(0,0,0,0.02)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
