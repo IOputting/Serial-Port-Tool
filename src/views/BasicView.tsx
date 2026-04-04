@@ -1,15 +1,17 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { useSerialStore, QuickCommand, LogEntry } from "../stores/useSerialStore";
+// 💡 必须确保你已经安装了 npm install react-virtuoso
 import { Virtuoso } from 'react-virtuoso';
 
 type SendMode = 'ascii' | 'hex' | 'timed' | 'file';
 
-// 💡 核心优化：将每一行日志抽离成独立子组件
-// 这样鼠标悬停只会触发这一行的高亮和刷新，绝对不会引起几万条数据的全局卡顿！
-const LogRow = ({ log, showInvisible }: { log: LogEntry, showInvisible: boolean }) => {
+// ==========================================
+// 1. 独立日志行组件
+// ==========================================
+const LogRow = memo(({ log, showInvisible }: { log: LogEntry, showInvisible: boolean }) => {
   const [isHovered, setIsHovered] = useState(false);
 
   const renderText = (text: string, isHex: boolean) => {
@@ -31,19 +33,17 @@ const LogRow = ({ log, showInvisible }: { log: LogEntry, showInvisible: boolean 
       style={{ 
         display: "flex", 
         justifyContent: "space-between",
-        // 💡 悬停时微微亮起的背景色，防看错行
         backgroundColor: isHovered ? "rgba(255, 255, 255, 0.05)" : "transparent",
         color: color, 
         wordBreak: "break-all", 
         fontFamily: "'Cascadia Code', Consolas, monospace", 
         fontSize: "14px", 
         lineHeight: "1.5",
-        paddingTop: log.isContinuous ? "2px" : "10px", // 连续块贴紧，新块加间距
+        paddingTop: log.isContinuous ? "2px" : "10px", 
         paddingBottom: "2px",
         transition: "background-color 0.15s ease"
       }}
     >
-      {/* 左侧：日志内容区 */}
       <div style={{ flex: 1, minWidth: 0 }}>
         {!log.isContinuous && (
           <div style={{ opacity: 0.8, marginBottom: "4px", padding: "0 15px", userSelect: "none" }}>
@@ -56,59 +56,45 @@ const LogRow = ({ log, showInvisible }: { log: LogEntry, showInvisible: boolean 
         </div>
       </div>
 
-      {/* 💡 右侧：悬停时间戳 (利用透明度实现平滑浮现) */}
       <div style={{
         paddingRight: "15px",
-        paddingTop: log.isContinuous ? "0px" : "20px", // 避免和顶部的头部时间撞车
+        paddingTop: log.isContinuous ? "0px" : "20px",
         opacity: isHovered ? 1 : 0, 
         transition: "opacity 0.2s ease",
         color: "#888",
         fontSize: "12px",
         userSelect: "none",
-        pointerEvents: "none", // 鼠标穿透，绝对不影响你拖动框选复制文字
+        pointerEvents: "none", 
         whiteSpace: "nowrap"
       }}>
         {log.time}
       </div>
     </div>
   );
-};
+}, (prevProps, nextProps) => {
+  return prevProps.log.id === nextProps.log.id && prevProps.showInvisible === nextProps.showInvisible;
+});
 
-export default function BasicView() {
-  const { isConnected, logs, clearLogs, isHexRecv, setIsHexRecv, executeSend } = useSerialStore();
-  
-  const [showInvisible, setShowInvisible] = useState(false); 
+
+// ==========================================
+// 2. 浏览器原生级别的“非受控”发送区域 (保持极致极速)
+// ==========================================
+const SendControlPanel = memo(({ isConnected, executeSend }: { isConnected: boolean, executeSend: any }) => {
   const [sendMode, setSendMode] = useState<SendMode>('ascii');
-  const [sendText, setSendText] = useState("");
   const [appendCrlf, setAppendCrlf] = useState(true);
   const [clearAfterSend, setClearAfterSend] = useState(true); 
   const [timerInterval, setTimerInterval] = useState(1000);
   const [isTimerRunning, setIsTimerRunning] = useState(false);
   const [timedIsHex, setTimedIsHex] = useState(false); 
   const [selectedFilePath, setSelectedFilePath] = useState("");
+  const [renderKey, setRenderKey] = useState(0);
   
-  const timerRef = useRef<number | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const isUserScrollingRef = useRef(false);
-
+  const [quickCommands, setQuickCommands] = useState<QuickCommand[]>([]);
   const [suggestions, setSuggestions] = useState<QuickCommand[]>([]);
   const [suggestionIdx, setSuggestionIdx] = useState(0);
-  const suggestionsListRef = useRef<HTMLDivElement>(null);
 
-  const handleScroll = () => {
-    if (!scrollContainerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
-    isUserScrollingRef.current = !isAtBottom;
-  };
-
-  useEffect(() => {
-    if (!isUserScrollingRef.current && logEndRef.current) {
-      logEndRef.current.scrollIntoView();
-    }
-  }, [logs]);
+  const timerRef = useRef<number | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if ((!isConnected || sendMode !== 'timed') && isTimerRunning) stopTimer();
@@ -123,21 +109,32 @@ export default function BasicView() {
     } else if (sendMode === 'timed') {
       if (isTimerRunning) stopTimer(); else startTimer();
     } else {
+      const textToSend = textareaRef.current?.value || "";
       const isHex = sendMode === 'hex';
-      const success = await executeSend(sendText, isHex, appendCrlf && !isHex);
+      const success = await executeSend(textToSend, isHex, appendCrlf && !isHex);
+      
       if (success) {
-        if (clearAfterSend) { setSendText(""); setSuggestions([]); }
+        if (clearAfterSend) { 
+          if (textareaRef.current) textareaRef.current.value = ""; 
+          setSuggestions([]); 
+          setRenderKey(prev => prev + 1); 
+        }
         setTimeout(() => textareaRef.current?.focus(), 50);
       }
     }
   };
 
   const startTimer = () => {
+    const textToSend = textareaRef.current?.value || "";
     if (!isConnected) return alert("请先连接串口！");
-    if (!sendText) return alert("请输入要发送的数据！");
+    if (!textToSend) return alert("请输入要发送的数据！");
     if (timerInterval < 10) return alert("定时时间不能小于 10ms");
-    setIsTimerRunning(true); executeSend(sendText, timedIsHex, appendCrlf && !timedIsHex); 
-    timerRef.current = window.setInterval(() => { executeSend(sendText, timedIsHex, appendCrlf && !timedIsHex); }, timerInterval);
+    
+    setIsTimerRunning(true); 
+    executeSend(textToSend, timedIsHex, appendCrlf && !timedIsHex); 
+    timerRef.current = window.setInterval(() => { 
+      executeSend(textToSend, timedIsHex, appendCrlf && !timedIsHex); 
+    }, timerInterval);
   };
 
   const stopTimer = () => { if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; } setIsTimerRunning(false); };
@@ -147,39 +144,49 @@ export default function BasicView() {
     if (selected) setSelectedFilePath(selected as string);
   };
 
-  const handleSaveLogs = async () => {
-    if (logs.length === 0) return alert("当前没有可保存的日志！");
+  const handleTextareaFocus = () => {
     try {
-      const textContent = logs.map(log => {
-        let prefix = log.type === 'send' ? "发送 -> " : log.type === 'recv' ? "接收 <- " : "系统 -- ";
-        // 导出文件时清理多余的换行符和空字符
-        const cleanText = log.text.replace(/\r/g, '');
-        return `[${log.time}] ${prefix}${cleanText}`;
-      }).join('\n');
-      const filePath = await save({ filters: [{ name: 'Log/Text File', extensions: ['txt', 'log'] }], defaultPath: 'serial_log.txt' });
-      if (filePath) { await writeTextFile(filePath, textContent); alert("日志保存成功！📂"); }
-    } catch (err: any) { alert("保存失败：" + (typeof err === 'string' ? err : err?.message)); }
+      const savedCmds = JSON.parse(localStorage.getItem('serial-quick-commands') || '[]');
+      setQuickCommands(savedCmds);
+    } catch (e) {
+      setQuickCommands([]);
+    }
   };
 
-  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value; setSendText(val);
-    const cursor = e.target.selectionStart;
+  const handleTextareaChange = () => {
+    if (!textareaRef.current) return;
+    const val = textareaRef.current.value; 
+    const cursor = textareaRef.current.selectionStart;
     const currentWord = val.substring(0, cursor).split(/\s+/).pop() || "";
+    
     if (currentWord.length > 0) {
-      const savedCmds = JSON.parse(localStorage.getItem('serial-quick-commands') || '[]');
-      setSuggestions(savedCmds.filter((c: QuickCommand) => c.data.toLowerCase().startsWith(currentWord.toLowerCase()))); setSuggestionIdx(0);
-    } else { setSuggestions([]); }
+      setSuggestions(quickCommands.filter((c: QuickCommand) => 
+        c.data.toLowerCase().startsWith(currentWord.toLowerCase())
+      )); 
+      setSuggestionIdx(0);
+    } else { 
+      setSuggestions([]); 
+    }
   };
 
   const applySuggestion = (selected: QuickCommand) => {
     if (!textareaRef.current) return;
-    const target = textareaRef.current; const cursor = target.selectionStart;
-    const textBeforeCursor = sendText.substring(0, cursor);
+    const target = textareaRef.current; 
+    const cursor = target.selectionStart;
+    const val = target.value;
+    
+    const textBeforeCursor = val.substring(0, cursor);
     const currentWord = textBeforeCursor.split(/\s+/).pop() || "";
     const newTextBefore = textBeforeCursor.substring(0, textBeforeCursor.length - currentWord.length) + selected.data;
-    const newText = newTextBefore + sendText.substring(cursor);
-    setSendText(newText); setSuggestions([]);
-    setTimeout(() => { target.focus(); target.selectionStart = target.selectionEnd = newTextBefore.length; }, 0);
+    const newText = newTextBefore + val.substring(cursor);
+    
+    target.value = newText; 
+    setSuggestions([]);
+    
+    setTimeout(() => { 
+      target.focus(); 
+      target.selectionStart = target.selectionEnd = newTextBefore.length; 
+    }, 0);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -190,7 +197,111 @@ export default function BasicView() {
       else if (e.key === 'Escape') { setSuggestions([]); return; }
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); handleMainSendAction(); }
-    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); setSendText(prev => prev + '\n'); }
+    if (e.key === 'Enter' && e.ctrlKey) { 
+      e.preventDefault(); 
+      if (textareaRef.current) {
+        const target = textareaRef.current;
+        const start = target.selectionStart;
+        const end = target.selectionEnd;
+        const val = target.value;
+        target.value = val.substring(0, start) + '\n' + val.substring(end);
+        target.selectionStart = target.selectionEnd = start + 1;
+        handleTextareaChange(); 
+      }
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "8px", backgroundColor: "#fff", padding: "10px 15px", borderRadius: "8px", boxShadow: "0 -2px 10px rgba(0,0,0,0.02)", position: "relative" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "6px", borderBottom: "1px solid #eee" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "15px" }}>
+          <span style={{ fontWeight: "bold", fontSize: "14px", color: "#333" }}>发送模式：</span>
+          <select value={sendMode} onChange={(e) => setSendMode(e.target.value as SendMode)} style={{ padding: "4px 8px", borderRadius: "4px", border: "1px solid #ccc", outline: "none", cursor: "pointer", fontSize: "13px" }}>
+            <option value="ascii">📝 手动 (ASCII)</option><option value="hex">📦 手动 (HEX)</option><option value="timed">⏱️ 定时发送</option><option value="file">📁 文件发送</option>
+          </select>
+          <div style={{ display: "flex", gap: "15px", marginLeft: "10px", borderLeft: "1px solid #ddd", paddingLeft: "15px" }}>
+            {sendMode === 'ascii' && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={appendCrlf} onChange={(e) => setAppendCrlf(e.target.checked)} />加回车换行</label>}
+            {sendMode === 'timed' && (
+              <>
+                <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: timedIsHex ? "#e91e63" : "#555" }}><input type="checkbox" checked={timedIsHex} onChange={(e) => setTimedIsHex(e.target.checked)} disabled={isTimerRunning} />以 HEX 发送</label>
+                {(!timedIsHex) && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={appendCrlf} onChange={(e) => setAppendCrlf(e.target.checked)} disabled={isTimerRunning} />加回车换行</label>}
+                <span style={{ fontSize: "13px", color: "#555", display: "flex", alignItems: "center", gap: "5px" }}>间隔: <input type="number" value={timerInterval} onChange={(e) => setTimerInterval(Number(e.target.value))} disabled={isTimerRunning} style={{ width: "60px", padding: "2px", border: "1px solid #ccc", borderRadius: "3px" }} /> ms</span>
+              </>
+            )}
+            {(sendMode === 'ascii' || sendMode === 'hex') && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={clearAfterSend} onChange={(e) => setClearAfterSend(e.target.checked)} />发送后清空</label>}
+          </div>
+        </div>
+      </div>
+
+      {suggestions.length > 0 && sendMode !== 'file' && (
+        <div style={{ position: 'absolute', bottom: '100%', left: '15px', marginBottom: '8px', backgroundColor: '#fff', border: '1px solid #ccc', borderRadius: '6px', boxShadow: '0 4px 12px rgba(0,0,0,0.2)', zIndex: 100, minWidth: '300px', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <div style={{ maxHeight: '175px', overflowY: 'auto' }}>
+            {suggestions.map((s, idx) => (
+              <div key={s.id} onMouseDown={(e) => { e.preventDefault(); applySuggestion(s); }} onMouseEnter={() => setSuggestionIdx(idx)} style={{ padding: '8px 12px', backgroundColor: idx === suggestionIdx ? '#e6f7ff' : '#fff', cursor: 'pointer', borderBottom: '1px solid #f0f0f0', fontSize: '13px', color: '#333' }}>
+                <span style={{ fontWeight: 'bold', color: '#0050b3' }}>{s.data}</span><span style={{ color: '#888', marginLeft: '10px' }}>({s.name})</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ padding: '4px 12px', fontSize: '11px', color: '#bbb', backgroundColor: '#fafafa', textAlign: 'right', borderTop: '1px solid #eee' }}>按 Tab/Enter 补全，↑/↓/滚轮 切换</div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: "10px", alignItems: "stretch" }}>
+        {sendMode === 'file' ? (
+          <div style={{ flex: 1, display: "flex", alignItems: "center", gap: "10px", backgroundColor: "#fafafa", padding: "8px 15px", borderRadius: "6px", border: "1px dashed #d9d9d9", minHeight: "60px", boxSizing: "border-box" }}>
+            <div style={{ fontSize: "20px", opacity: 0.5 }}>📄</div>
+            <input type="text" value={selectedFilePath} readOnly placeholder="请点击右侧按钮选择文件..." style={{ flex: 1, padding: "8px 12px", borderRadius: "4px", border: "1px solid #ccc", outline: "none", backgroundColor: "#fff", fontSize: "14px" }} />
+            <button onClick={handleSelectFile} style={{ padding: "8px 15px", cursor: "pointer", border: "1px solid #1890ff", backgroundColor: "#e6f7ff", color: "#1890ff", borderRadius: "4px", fontWeight: "bold", fontSize: "14px" }}>浏览文件</button>
+          </div>
+        ) : (
+          <textarea 
+            key={renderKey}
+            ref={textareaRef} 
+            onChange={handleTextareaChange} 
+            onFocus={handleTextareaFocus}
+            onKeyDown={handleKeyDown} 
+            onBlur={() => setTimeout(() => setSuggestions([]), 150)}
+            disabled={!isConnected || (sendMode === 'timed' && isTimerRunning)} 
+            placeholder={sendMode === 'hex' ? "在此输入 HEX 数据(如: FF 0A)..." : "在此输入发送内容(换行: Ctrl+Enter)..."} 
+            style={{ 
+              flex: 1, minWidth: 0, minHeight: "60px", height: "60px", padding: "10px 12px", borderRadius: "6px", 
+              border: "1px solid #d9d9d9", outline: "none", resize: "none", 
+              fontFamily: "'Cascadia Code', Consolas, 'Microsoft YaHei', monospace", 
+              fontSize: "14px", fontWeight: "normal", WebkitFontSmoothing: "antialiased", lineHeight: "1.5", 
+              cursor: (isConnected && !isTimerRunning) ? "text" : "not-allowed", 
+              backgroundColor: (isConnected && !isTimerRunning) ? "#fff" : "#f5f5f5", boxSizing: "border-box", 
+              overflowY: "auto", wordBreak: "break-word" 
+            }}
+          />
+        )}
+        <button onClick={handleMainSendAction} disabled={!isConnected} style={{ width: "120px", cursor: isConnected ? "pointer" : "not-allowed", backgroundColor: !isConnected ? "#d9d9d9" : (sendMode === 'timed' && isTimerRunning) ? "#ff4d4f" : "#1890ff", color: "white", border: "none", borderRadius: "6px", fontWeight: "bold", fontSize: "15px", display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: "6px", transition: "all 0.2s" }}>
+          <span>{sendMode === 'timed' ? (isTimerRunning ? '停止定时' : '开始定时') : sendMode === 'file' ? '发送文件' : '发送'}</span>
+          {sendMode !== 'timed' && sendMode !== 'file' && <span style={{ fontSize: "12px", fontWeight: "normal", opacity: 0.8 }}>(Enter)</span>}
+        </button>
+      </div>
+    </div>
+  );
+});
+
+
+// ==========================================
+// 3. 顶层主视图 (接入 Virtuoso 虚拟列表)
+// ==========================================
+export default function BasicView() {
+  const { isConnected, logs, clearLogs, isHexRecv, setIsHexRecv, executeSend } = useSerialStore();
+  const [showInvisible, setShowInvisible] = useState(false); 
+
+  const handleSaveLogs = async () => {
+    if (logs.length === 0) return alert("当前没有可保存的日志！");
+    try {
+      const textContent = logs.map(log => {
+        let prefix = log.type === 'send' ? "发送 -> " : log.type === 'recv' ? "接收 <- " : "系统 -- ";
+        const cleanText = log.text.replace(/\r/g, '');
+        return `[${log.time}] ${prefix}${cleanText}`;
+      }).join('\n');
+      const filePath = await save({ filters: [{ name: 'Log/Text File', extensions: ['txt', 'log'] }], defaultPath: 'serial_log.txt' });
+      if (filePath) { await writeTextFile(filePath, textContent); alert("日志保存成功！📂"); }
+    } catch (err: any) { alert("保存失败：" + (typeof err === 'string' ? err : err?.message)); }
   };
 
   return (
@@ -223,78 +334,26 @@ export default function BasicView() {
         </div>
       </div>
 
-      {/* 终端输出框 */}
-      <div 
-        ref={scrollContainerRef}
-        onScroll={handleScroll}
-        style={{ flex: 1, backgroundColor: "#1e1e1e", borderRadius: "8px", overflowY: "auto", overflowX: "hidden", boxShadow: "inset 0 2px 10px rgba(0,0,0,0.2)", paddingBottom: "10px" }}
-      >
-        {logs.length === 0 ? <div style={{ padding: "15px", color: "#666", fontFamily: "'Cascadia Code', Consolas, monospace", fontSize: "14px" }}>等待数据传输...</div> : null}
-        
-        {/* 💡 注入独立子组件 */}
-        {logs.map((log) => (
-          <LogRow key={log.id} log={log} showInvisible={showInvisible} />
-        ))}
-
-        <div ref={logEndRef} style={{ height: "1px" }} />
-      </div>
-
-      {/* 发送控制区 */}
-      <div style={{ display: "flex", flexDirection: "column", gap: "8px", backgroundColor: "#fff", padding: "10px 15px", borderRadius: "8px", boxShadow: "0 -2px 10px rgba(0,0,0,0.02)", position: "relative" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "6px", borderBottom: "1px solid #eee" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "15px" }}>
-            <span style={{ fontWeight: "bold", fontSize: "14px", color: "#333" }}>发送模式：</span>
-            <select value={sendMode} onChange={(e) => setSendMode(e.target.value as SendMode)} style={{ padding: "4px 8px", borderRadius: "4px", border: "1px solid #ccc", outline: "none", cursor: "pointer", fontSize: "13px" }}>
-              <option value="ascii">📝 手动 (ASCII)</option><option value="hex">📦 手动 (HEX)</option><option value="timed">⏱️ 定时发送</option><option value="file">📁 文件发送</option>
-            </select>
-            <div style={{ display: "flex", gap: "15px", marginLeft: "10px", borderLeft: "1px solid #ddd", paddingLeft: "15px" }}>
-              {sendMode === 'ascii' && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={appendCrlf} onChange={(e) => setAppendCrlf(e.target.checked)} />加回车换行</label>}
-              {sendMode === 'timed' && (
-                <>
-                  <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: timedIsHex ? "#e91e63" : "#555" }}><input type="checkbox" checked={timedIsHex} onChange={(e) => setTimedIsHex(e.target.checked)} disabled={isTimerRunning} />以 HEX 发送</label>
-                  {(!timedIsHex) && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={appendCrlf} onChange={(e) => setAppendCrlf(e.target.checked)} disabled={isTimerRunning} />加回车换行</label>}
-                  <span style={{ fontSize: "13px", color: "#555", display: "flex", alignItems: "center", gap: "5px" }}>间隔: <input type="number" value={timerInterval} onChange={(e) => setTimerInterval(Number(e.target.value))} disabled={isTimerRunning} style={{ width: "60px", padding: "2px", border: "1px solid #ccc", borderRadius: "3px" }} /> ms</span>
-                </>
-              )}
-              {(sendMode === 'ascii' || sendMode === 'hex') && <label style={{ fontSize: "13px", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px", color: "#555" }}><input type="checkbox" checked={clearAfterSend} onChange={(e) => setClearAfterSend(e.target.checked)} />发送后清空</label>}
-            </div>
-          </div>
-        </div>
-
-        {suggestions.length > 0 && sendMode !== 'file' && (
-          <div style={{ position: 'absolute', bottom: '100%', left: '15px', marginBottom: '8px', backgroundColor: '#fff', border: '1px solid #ccc', borderRadius: '6px', boxShadow: '0 4px 12px rgba(0,0,0,0.2)', zIndex: 100, minWidth: '300px', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <div ref={suggestionsListRef} style={{ maxHeight: '175px', overflowY: 'auto' }}>
-              {suggestions.map((s, idx) => (
-                <div key={s.id} onMouseDown={(e) => { e.preventDefault(); applySuggestion(s); }} onMouseEnter={() => setSuggestionIdx(idx)} style={{ padding: '8px 12px', backgroundColor: idx === suggestionIdx ? '#e6f7ff' : '#fff', cursor: 'pointer', borderBottom: '1px solid #f0f0f0', fontSize: '13px', color: '#333' }}>
-                  <span style={{ fontWeight: 'bold', color: '#0050b3' }}>{s.data}</span><span style={{ color: '#888', marginLeft: '10px' }}>({s.name})</span>
-                </div>
-              ))}
-            </div>
-            <div style={{ padding: '4px 12px', fontSize: '11px', color: '#bbb', backgroundColor: '#fafafa', textAlign: 'right', borderTop: '1px solid #eee' }}>按 Tab/Enter 补全，↑/↓/滚轮 切换</div>
-          </div>
+      {/* 🚀 真正的工业级日志区：接入 Virtuoso 虚拟列表 */}
+      <div style={{ flex: 1, backgroundColor: "#1e1e1e", borderRadius: "8px", overflow: "hidden", boxShadow: "inset 0 2px 10px rgba(0,0,0,0.2)" }}>
+        {logs.length === 0 ? (
+          <div style={{ padding: "15px", color: "#666", fontFamily: "'Cascadia Code', Consolas, monospace", fontSize: "14px" }}>等待数据传输...</div>
+        ) : (
+          <Virtuoso
+            style={{ height: '100%', width: '100%' }}
+            data={logs}
+            // 💡 神仙属性：自动完美跟随最新消息滚动！你往上翻看历史时它还会智能停住！
+            followOutput="auto" 
+            itemContent={(index, log) => (
+              <LogRow log={log} showInvisible={showInvisible} />
+            )}
+          />
         )}
-
-        <div style={{ display: "flex", gap: "10px", alignItems: "stretch" }}>
-          {sendMode === 'file' ? (
-            <div style={{ flex: 1, display: "flex", alignItems: "center", gap: "10px", backgroundColor: "#fafafa", padding: "8px 15px", borderRadius: "6px", border: "1px dashed #d9d9d9", minHeight: "60px", boxSizing: "border-box" }}>
-              <div style={{ fontSize: "20px", opacity: 0.5 }}>📄</div>
-              <input type="text" value={selectedFilePath} readOnly placeholder="请点击右侧按钮选择文件..." style={{ flex: 1, padding: "8px 12px", borderRadius: "4px", border: "1px solid #ccc", outline: "none", backgroundColor: "#fff", fontSize: "14px" }} />
-              <button onClick={handleSelectFile} style={{ padding: "8px 15px", cursor: "pointer", border: "1px solid #1890ff", backgroundColor: "#e6f7ff", color: "#1890ff", borderRadius: "4px", fontWeight: "bold", fontSize: "14px" }}>浏览文件</button>
-            </div>
-          ) : (
-            <textarea 
-              ref={textareaRef} value={sendText} onChange={handleTextareaChange} onKeyDown={handleKeyDown} onBlur={() => setTimeout(() => setSuggestions([]), 150)}
-              disabled={!isConnected || (sendMode === 'timed' && isTimerRunning)} placeholder={sendMode === 'hex' ? "在此输入 HEX 数据 (如: FF 0A)..." : "在此输入发送内容 (换行: Ctrl+Enter)..."} 
-              style={{ flex: 1, minHeight: "60px", height: "60px", padding: "8px 12px", borderRadius: "6px", border: "1px solid #d9d9d9", outline: "none", resize: "none", fontFamily: "inherit", fontSize: "14px", lineHeight: "1.5", cursor: (isConnected && !isTimerRunning) ? "text" : "not-allowed", backgroundColor: (isConnected && !isTimerRunning) ? "#fff" : "#f5f5f5", boxSizing: "border-box", overflowY: "auto" }}
-            />
-          )}
-
-          <button onClick={handleMainSendAction} disabled={!isConnected} style={{ width: "120px", cursor: isConnected ? "pointer" : "not-allowed", backgroundColor: !isConnected ? "#d9d9d9" : (sendMode === 'timed' && isTimerRunning) ? "#ff4d4f" : "#1890ff", color: "white", border: "none", borderRadius: "6px", fontWeight: "bold", fontSize: "15px", display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: "6px", transition: "all 0.2s" }}>
-            <span>{sendMode === 'timed' ? (isTimerRunning ? '停止定时' : '开始定时') : sendMode === 'file' ? '发送文件' : '发送'}</span>
-            {sendMode !== 'timed' && sendMode !== 'file' && <span style={{ fontSize: "12px", fontWeight: "normal", opacity: 0.8 }}>(Enter)</span>}
-          </button>
-        </div>
       </div>
+
+      {/* 完美隔离的发送区 */}
+      <SendControlPanel isConnected={isConnected} executeSend={executeSend} />
+      
     </div>
   );
 }
