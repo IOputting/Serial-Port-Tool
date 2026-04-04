@@ -2,9 +2,77 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
-import { useSerialStore, QuickCommand } from "../stores/useSerialStore";
+import { useSerialStore, QuickCommand, LogEntry } from "../stores/useSerialStore";
+import { Virtuoso } from 'react-virtuoso';
 
 type SendMode = 'ascii' | 'hex' | 'timed' | 'file';
+
+// 💡 核心优化：将每一行日志抽离成独立子组件
+// 这样鼠标悬停只会触发这一行的高亮和刷新，绝对不会引起几万条数据的全局卡顿！
+const LogRow = ({ log, showInvisible }: { log: LogEntry, showInvisible: boolean }) => {
+  const [isHovered, setIsHovered] = useState(false);
+
+  const renderText = (text: string, isHex: boolean) => {
+    if (!isHex && showInvisible) return text.replace(/\r/g, '\\r').replace(/\n/g, '\\n\n').replace(/\0/g, '\\0');
+    if (!isHex) return text.replace(/\r/g, ''); 
+    return text;
+  };
+
+  let color = "#fff"; 
+  let prefix = "";
+  if (log.type === 'send') { color = "#40a9ff"; prefix = "-> "; } 
+  else if (log.type === 'recv') { color = "#73d13d"; prefix = "<- "; } 
+  else if (log.type === 'sys') { color = "#ffc53d"; prefix = "SYS "; } 
+
+  return (
+    <div
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+      style={{ 
+        display: "flex", 
+        justifyContent: "space-between",
+        // 💡 悬停时微微亮起的背景色，防看错行
+        backgroundColor: isHovered ? "rgba(255, 255, 255, 0.05)" : "transparent",
+        color: color, 
+        wordBreak: "break-all", 
+        fontFamily: "'Cascadia Code', Consolas, monospace", 
+        fontSize: "14px", 
+        lineHeight: "1.5",
+        paddingTop: log.isContinuous ? "2px" : "10px", // 连续块贴紧，新块加间距
+        paddingBottom: "2px",
+        transition: "background-color 0.15s ease"
+      }}
+    >
+      {/* 左侧：日志内容区 */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {!log.isContinuous && (
+          <div style={{ opacity: 0.8, marginBottom: "4px", padding: "0 15px", userSelect: "none" }}>
+            <span style={{ color: "#777", marginRight: "8px", fontSize: "12px" }}>[{log.time}]</span>
+            <span>{prefix}</span>
+          </div>
+        )}
+        <div style={{ whiteSpace: "pre-wrap", paddingLeft: "15px", paddingRight: "15px" }}>
+          {renderText(log.text, log.isHex)}
+        </div>
+      </div>
+
+      {/* 💡 右侧：悬停时间戳 (利用透明度实现平滑浮现) */}
+      <div style={{
+        paddingRight: "15px",
+        paddingTop: log.isContinuous ? "0px" : "20px", // 避免和顶部的头部时间撞车
+        opacity: isHovered ? 1 : 0, 
+        transition: "opacity 0.2s ease",
+        color: "#888",
+        fontSize: "12px",
+        userSelect: "none",
+        pointerEvents: "none", // 鼠标穿透，绝对不影响你拖动框选复制文字
+        whiteSpace: "nowrap"
+      }}>
+        {log.time}
+      </div>
+    </div>
+  );
+};
 
 export default function BasicView() {
   const { isConnected, logs, clearLogs, isHexRecv, setIsHexRecv, executeSend } = useSerialStore();
@@ -20,14 +88,27 @@ export default function BasicView() {
   const [selectedFilePath, setSelectedFilePath] = useState("");
   
   const timerRef = useRef<number | null>(null);
-  const logEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const logEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isUserScrollingRef = useRef(false);
 
   const [suggestions, setSuggestions] = useState<QuickCommand[]>([]);
   const [suggestionIdx, setSuggestionIdx] = useState(0);
   const suggestionsListRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
+  const handleScroll = () => {
+    if (!scrollContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+    isUserScrollingRef.current = !isAtBottom;
+  };
+
+  useEffect(() => {
+    if (!isUserScrollingRef.current && logEndRef.current) {
+      logEndRef.current.scrollIntoView();
+    }
+  }, [logs]);
 
   useEffect(() => {
     if ((!isConnected || sendMode !== 'timed') && isTimerRunning) stopTimer();
@@ -70,12 +151,10 @@ export default function BasicView() {
     if (logs.length === 0) return alert("当前没有可保存的日志！");
     try {
       const textContent = logs.map(log => {
-        let prefix = "";
-        if (log.type === 'send') prefix = "发送 -> ";
-        else if (log.type === 'recv') prefix = "接收 <- ";
-        else if (log.type === 'sys') prefix = "系统 -- ";
-        const text = renderHighlightedText(log.text, log.isHex);
-        return `[${log.time}] ${prefix}${text}`;
+        let prefix = log.type === 'send' ? "发送 -> " : log.type === 'recv' ? "接收 <- " : "系统 -- ";
+        // 导出文件时清理多余的换行符和空字符
+        const cleanText = log.text.replace(/\r/g, '');
+        return `[${log.time}] ${prefix}${cleanText}`;
       }).join('\n');
       const filePath = await save({ filters: [{ name: 'Log/Text File', extensions: ['txt', 'log'] }], defaultPath: 'serial_log.txt' });
       if (filePath) { await writeTextFile(filePath, textContent); alert("日志保存成功！📂"); }
@@ -114,14 +193,10 @@ export default function BasicView() {
     if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); setSendText(prev => prev + '\n'); }
   };
 
-  const renderHighlightedText = (text: string, isHex: boolean) => {
-    if (!isHex && showInvisible) return text.replace(/\r/g, '\\r').replace(/\n/g, '\\n\n').replace(/\0/g, '\\0');
-    return text;
-  };
-
   return (
     <div style={{ flex: 1, height: "100%", display: "flex", flexDirection: "column", padding: "20px", gap: "15px", position: "relative", boxSizing: "border-box" }}>
-      {/* 日志控制工具栏 */}
+      
+      {/* 顶部控制栏 */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", backgroundColor: "#fff", padding: "8px 15px", borderRadius: "8px", border: "1px solid #e8e8e8", boxShadow: "0 1px 4px rgba(0,0,0,0.02)" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "50%", backgroundColor: isConnected ? "#52c41a" : "#f5222d", boxShadow: isConnected ? "0 0 6px #52c41a" : "none" }}></span>
@@ -148,23 +223,20 @@ export default function BasicView() {
         </div>
       </div>
 
-      {/* 日志输出框 */}
-      <div style={{ flex: 1, backgroundColor: "#1e1e1e", padding: "15px", borderRadius: "8px", overflowY: "auto", whiteSpace: "pre-wrap", fontFamily: "'Cascadia Code', Consolas, monospace", fontSize: "14px", boxShadow: "inset 0 2px 10px rgba(0,0,0,0.2)" }}>
-        {logs.length === 0 ? <span style={{ color: "#666" }}>等待数据传输...</span> : null}
-        {logs.map((log) => {
-          let color = "#fff"; let prefix = "";
-          if (log.type === 'send') { color = "#40a9ff"; prefix = "-> \n"; } 
-          else if (log.type === 'recv') { color = "#73d13d"; prefix = "<- \n"; } 
-          else if (log.type === 'sys') { color = "#ffc53d"; prefix = "SYS "; } 
-          return (
-            <div key={log.id} style={{ color: color, wordBreak: "break-all", marginBottom: "6px", lineHeight: "1.5" }}>
-              <span style={{ color: "#777", marginRight: "8px", userSelect: "none", fontSize: "12px" }}>[{log.time}]</span>
-              <span style={{ opacity: 0.6, userSelect: "none", marginRight: "5px" }}>{prefix}</span>
-              <span>{renderHighlightedText(log.text, log.isHex)}</span>
-            </div>
-          );
-        })}
-        <div ref={logEndRef} />
+      {/* 终端输出框 */}
+      <div 
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        style={{ flex: 1, backgroundColor: "#1e1e1e", borderRadius: "8px", overflowY: "auto", overflowX: "hidden", boxShadow: "inset 0 2px 10px rgba(0,0,0,0.2)", paddingBottom: "10px" }}
+      >
+        {logs.length === 0 ? <div style={{ padding: "15px", color: "#666", fontFamily: "'Cascadia Code', Consolas, monospace", fontSize: "14px" }}>等待数据传输...</div> : null}
+        
+        {/* 💡 注入独立子组件 */}
+        {logs.map((log) => (
+          <LogRow key={log.id} log={log} showInvisible={showInvisible} />
+        ))}
+
+        <div ref={logEndRef} style={{ height: "1px" }} />
       </div>
 
       {/* 发送控制区 */}

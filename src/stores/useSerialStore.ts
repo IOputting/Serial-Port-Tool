@@ -2,7 +2,15 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 
 export type LogType = 'send' | 'recv' | 'sys';
-export interface LogEntry { id: string; type: LogType; text: string; time: string; isHex: boolean; }
+export interface LogEntry { 
+  id: string; 
+  type: LogType; 
+  text: string; 
+  time: string; 
+  timestampMs: number; // 💡 用于计算时间差
+  isHex: boolean; 
+  isContinuous?: boolean; // 💡 控制是否隐藏时间戳
+}
 export interface QuickCommand { id: string; name: string; data: string; isHex: boolean; }
 export type ViewMode = 'basic' | 'oscilloscope' | 'script';
 
@@ -15,33 +23,57 @@ export const getTimestamp = () => {
 interface SerialState {
   activeView: ViewMode;
   setActiveView: (view: ViewMode) => void;
-  
   isConnected: boolean;
   setIsConnected: (status: boolean) => void;
   
   logs: LogEntry[];
   addLog: (log: LogEntry) => void;
-  setLogs: (updater: LogEntry[] | ((prev: LogEntry[]) => LogEntry[])) => void;
+  addLogsBatch: (logs: LogEntry[]) => void; // 💡 批量添加
   clearLogs: () => void;
   
   isHexRecv: boolean;
   setIsHexRecv: (status: boolean) => void;
-  
   executeSend: (data: string, isHex: boolean, useCrlf: boolean) => Promise<boolean>;
 }
 
 export const useSerialStore = create<SerialState>((set, get) => ({
   activeView: 'basic',
   setActiveView: (view) => set({ activeView: view }),
-
   isConnected: false,
   setIsConnected: (status) => set({ isConnected: status }),
-  
   logs: [],
-  addLog: (log) => set((state) => ({ logs: [...state.logs, log] })),
-  setLogs: (updater) => set((state) => ({ logs: typeof updater === 'function' ? updater(state.logs) : updater })),
+
+  addLog: (log) => set((state) => {
+    const newLogs = [...state.logs];
+    const lastLog = newLogs.length > 0 ? newLogs[newLogs.length - 1] : null;
+    // 判断是否连续 (同类型，且相差不到 2000 毫秒)
+    if (lastLog && log.type === lastLog.type && log.type !== 'sys' && (log.timestampMs - lastLog.timestampMs < 2000)) {
+      log.isContinuous = true;
+    } else {
+      log.isContinuous = false;
+    }
+    newLogs.push(log);
+    if (newLogs.length > 3000) return { logs: newLogs.slice(newLogs.length - 3000) };
+    return { logs: newLogs };
+  }),
+
+  addLogsBatch: (entries) => set((state) => {
+    const newLogs = [...state.logs];
+    let lastLog = newLogs.length > 0 ? newLogs[newLogs.length - 1] : null;
+    entries.forEach(log => {
+      if (lastLog && log.type === lastLog.type && log.type !== 'sys' && (log.timestampMs - lastLog.timestampMs < 2000)) {
+        log.isContinuous = true;
+      } else {
+        log.isContinuous = false;
+      }
+      newLogs.push(log);
+      lastLog = log;
+    });
+    if (newLogs.length > 3000) return { logs: newLogs.slice(newLogs.length - 3000) };
+    return { logs: newLogs };
+  }),
+
   clearLogs: () => set({ logs: [] }),
-  
   isHexRecv: false,
   setIsHexRecv: (status) => set({ isHexRecv: status }),
   
@@ -53,11 +85,13 @@ export const useSerialStore = create<SerialState>((set, get) => ({
     if (!isHex && useCrlf) dataToSend += "\r\n"; 
     try {
       await invoke("send_data", { data: dataToSend, isHex: isHex });
-      state.addLog({ id: crypto.randomUUID(), type: 'send', text: dataToSend + (isHex ? '\n' : ''), time: getTimestamp(), isHex: isHex });
+      state.addLog({ 
+        id: crypto.randomUUID(), type: 'send', text: dataToSend + (isHex ? '\n' : ''), 
+        time: getTimestamp(), timestampMs: Date.now(), isHex: isHex 
+      });
       return true;
     } catch (e) { 
-      alert("发送报错: " + e); 
-      return false; 
+      alert("发送报错: " + e); return false; 
     }
   }
 }));
